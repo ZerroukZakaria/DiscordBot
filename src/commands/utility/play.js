@@ -1,6 +1,10 @@
-const { SlashCommandBuilder } = require('discord.js');
+const { SlashCommandBuilder} = require('discord.js');
 const axios = require('axios');
 const { youtubeToken } = require('../../../config.json');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
+const ytdl = require('ytdl-core-discord');
+
+
 const youtubeAPI = 'https://www.googleapis.com/youtube/v3/playlistItems';
 
 
@@ -34,6 +38,7 @@ module.exports = {
 
 async function playSong(interaction, songUrl) {
     const voiceChannel = interaction.member.voice.channel;
+
     if (!voiceChannel) {
         return interaction.reply("You need to join a voice channel first!");
     }
@@ -49,9 +54,14 @@ async function playSong(interaction, songUrl) {
     });
 
     const stream = ytdl(songUrl, { filter: 'audioonly' });
-    const resource = createAudioResource(stream, { inputType: AudioPlayerStatus.Playing });
+    const resource = createAudioResource(stream);
 
     const player = createAudioPlayer();
+
+    player.on('error', (error) => {
+        console.error('Error occurred while playing song:', error);
+    });
+    
     player.play(resource);
 
     connection.subscribe(player);
@@ -60,6 +70,12 @@ async function playSong(interaction, songUrl) {
         console.log('Song finished, playing next song.');
         connection.disconnect();
     });
+}
+
+async function playPlaylist(interaction, playlist) {
+    for (let song of playlist) {
+        await playSong(interaction, song.videoUrl);
+    }
 }
 
 
