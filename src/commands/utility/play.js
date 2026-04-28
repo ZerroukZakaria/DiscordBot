@@ -1,119 +1,132 @@
-const { SlashCommandBuilder} = require('discord.js');
-const axios = require('axios');
-const { youtubeToken } = require('../../../config.json');
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus } = require('@discordjs/voice');
-const ytdl = require('ytdl-core-discord');
+const { SlashCommandBuilder, MessageFlags } = require('discord.js');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
+const play = require('play-dl');
 
-
-const youtubeAPI = 'https://www.googleapis.com/youtube/v3/playlistItems';
-
+// Per-guild queue map
+const queues = new Map();
 
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('play')
         .setDescription('Plays songs from two YouTube playlists merged and shuffled.')
-        .addStringOption(option => 
+        .addStringOption(option =>
             option.setName('playlist1')
                 .setDescription('The first YouTube playlist URL')
                 .setRequired(true))
-        .addStringOption(option => 
+        .addStringOption(option =>
             option.setName('playlist2')
                 .setDescription('The second YouTube playlist URL')
                 .setRequired(true)),
 
     async execute(interaction) {
-        const playlistUrl1 = interaction.options.getString('playlist1');
-        const playlistUrl2 = interaction.options.getString('playlist2');
+        const voiceChannel = interaction.member.voice.channel;
+        if (!voiceChannel) {
+            return interaction.reply({ content: 'You need to join a voice channel first!', flags: MessageFlags.Ephemeral });
+        }
 
-        const playlistId1 = extractPlaylistId(playlistUrl1); // Extract playlist ID from URL
-        const playlistId2 = extractPlaylistId(playlistUrl2); // Extract playlist ID from URL
+        await interaction.deferReply();
+        await interaction.editReply({ content: 'Kumiko is tuning her euphonium...' });
 
-        const mergedPlaylist = await mergeAndShufflePlaylists(playlistId1, playlistId2);
-        await playPlaylist(interaction, mergedPlaylist);
+        const url1 = interaction.options.getString('playlist1');
+        const url2 = interaction.options.getString('playlist2');
 
-        return interaction.reply('Now playing songs from both playlists!');
+        let tracks = [];
+        for (const url of [url1, url2]) {
+            try {
+                const playlist = await play.playlist_info(url, { incomplete: true });
+                const videos = await playlist.all_videos();
+                tracks.push(...videos.map(v => ({ title: v.title, url: v.url })));
+            } catch (err) {
+                console.error(`Failed to fetch playlist ${url}:`, err);
+            }
+        }
+
+        if (tracks.length === 0) {
+            return interaction.editReply('Could not fetch any tracks from those playlists.');
+        }
+
+        shuffle(tracks);
+
+        const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: interaction.guild.id,
+            adapterCreator: interaction.guild.voiceAdapterCreator,
+            selfDeaf: true,
+        });
+
+        try {
+            await entersState(connection, VoiceConnectionStatus.Ready, 30_000);
+        } catch {
+            connection.destroy();
+            return interaction.editReply('Could not connect to the voice channel. Make sure I have permission to join and speak.');
+        }
+
+        // Destroy any existing queue for this guild before starting a new one
+        const existing = queues.get(interaction.guild.id);
+        if (existing) {
+            existing.player.removeAllListeners();
+            existing.connection.destroy();
+            queues.delete(interaction.guild.id);
+        }
+
+        const player = createAudioPlayer();
+        connection.subscribe(player);
+
+        const queue = { tracks, index: 0, player, connection };
+        queues.set(interaction.guild.id, queue);
+
+        // Register listeners before starting playback to avoid race condition
+        player.on(AudioPlayerStatus.Idle, async () => {
+            const q = queues.get(interaction.guild.id);
+            if (!q) return;
+            q.index++;
+            if (q.index < q.tracks.length) {
+                await playNext(interaction.guild.id);
+            } else {
+                queues.delete(interaction.guild.id);
+                connection.destroy();
+            }
+        });
+
+        player.on('error', error => {
+            console.error('Audio player error:', error);
+            const q = queues.get(interaction.guild.id);
+            if (!q) return;
+            q.index++;
+            playNext(interaction.guild.id).catch(console.error);
+        });
+
+        await interaction.editReply(`Tuned up! Queued **${tracks.length}** tracks from both playlists. Starting now!`);
+
+        await playNext(interaction.guild.id);
     },
 };
 
-
-async function playSong(interaction, songUrl) {
-    const voiceChannel = interaction.member.voice.channel;
-
-    if (!voiceChannel) {
-        return interaction.reply("You need to join a voice channel first!");
-    }
-
-    const connection = joinVoiceChannel({
-        channelId: voiceChannel.id,
-        guildId: interaction.guild.id,
-        adapterCreator: interaction.guild.voiceAdapterCreator,
-    });
-
-    connection.on(VoiceConnectionStatus.Ready, () => {
-        console.log("Successfully connected to the voice channel!");
-    });
-
-    const stream = ytdl(songUrl, { filter: 'audioonly' });
-    const resource = createAudioResource(stream);
-
-    const player = createAudioPlayer();
-
-    player.on('error', (error) => {
-        console.error('Error occurred while playing song:', error);
-    });
-    
-    player.play(resource);
-
-    connection.subscribe(player);
-
-    player.on(AudioPlayerStatus.Idle, () => {
-        console.log('Song finished, playing next song.');
-        connection.disconnect();
-    });
-}
-
-async function playPlaylist(interaction, playlist) {
-    for (let song of playlist) {
-        await playSong(interaction, song.videoUrl);
-    }
-}
-
-
-
-async function mergeAndShufflePlaylists(playlistId1, playlistId2) {
-    const playlist1 = await getPlaylistVideos(playlistId1);
-    const playlist2 = await getPlaylistVideos(playlistId2);
-    const mergedPlaylists = [...playlist1, ...playlist2];
-    shuffle(mergedPlaylists);
-    return mergedPlaylists;
-}
-
-async function getPlaylistVideos(playlistId) {
-    const url = `${youtubeAPI}?part=snippet&maxResults=50&playlistId=${playlistId}&key=${youtubeToken}`;
+async function playNext(guildId) {
+    const queue = queues.get(guildId);
+    if (!queue) return;
+    const track = queue.tracks[queue.index];
     try {
-        const response = await axios.get(url);
-        return response.data.items.map(item => ({
-            title: item.snippet.title,
-            videoUrl: `https://www.youtube.com/watch?v=${item.snippet.resourceId.videoId}`
-        }));
-    } catch (error) {
-        console.error(error);
-        return [];
+        const source = await play.stream(track.url);
+        const resource = createAudioResource(source.stream, { inputType: source.type });
+        queue.player.play(resource);
+        console.log(`Now playing: ${track.title}`);
+    } catch (err) {
+        console.error(`Failed to stream ${track.title}:`, err);
+        queue.index++;
+        if (queue.index < queue.tracks.length) {
+            await playNext(guildId);
+        } else {
+            queues.delete(guildId);
+            queue.connection.destroy();
+        }
     }
 }
 
-
-const shuffle = (array) => {
+function shuffle(array) {
     for (let i = array.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
-        [array[i], array[j]] = [array[j], array[i]]; // Swap elements
+        [array[i], array[j]] = [array[j], array[i]];
     }
-};
-
-
-function extractPlaylistId(url) {
-    const regex = /(?:list=)([a-zA-Z0-9_-]+)/;
-    const match = url.match(regex);
-    return match ? match[1] : null;
 }
 

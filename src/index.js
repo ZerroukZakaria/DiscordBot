@@ -1,12 +1,19 @@
 // Require the necessary discord.js classes
-const { Client, Collection, Events, GatewayIntentBits } = require('discord.js');
+const { Client, Collection, Events, GatewayIntentBits, MessageFlags } = require('discord.js');
 const fs = require('node:fs');
 const path = require('node:path');
-const { token } = require('../config.json');
+const { token, userId, channelId, stickerId } = require('../config.json');
 
 
 // Create a new client instance
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+const client = new Client({
+	intents: [
+		GatewayIntentBits.Guilds,
+		GatewayIntentBits.GuildPresences,
+		GatewayIntentBits.GuildMembers,
+		GatewayIntentBits.GuildVoiceStates,
+	],
+});
 
 client.commands = new Collection();
 
@@ -19,7 +26,6 @@ for (const folder of commandFolders) {
 	for (const file of commandFiles) {
 		const filePath = path.join(commandsPath, file);
 		const command = require(filePath);
-		// Set a new item in the Collection with the key as the command name and the value as the exported module
 		if ('data' in command && 'execute' in command) {
 			client.commands.set(command.data.name, command);
 		} else {
@@ -28,9 +34,6 @@ for (const folder of commandFolders) {
 	}
 }
 
-// When the client is ready, run this code (only once).
-// The distinction between `client: Client<boolean>` and `readyClient: Client<true>` is important for TypeScript developers.
-// It makes some properties non-nullable.
 client.once(Events.ClientReady, readyClient => {
 	console.log(`Ready! Logged in as ${readyClient.user.tag}`);
 });
@@ -48,14 +51,33 @@ client.on(Events.InteractionCreate, async interaction => {
 		await command.execute(interaction);
 	} catch (error) {
 		console.error(error);
-		if (interaction.replied || interaction.deferred) {
-			await interaction.followUp({ content: 'There was an error while executing this command!', flags: MessageFlags.Ephemeral });
-		} else {
-			await interaction.reply({ content: 'There was an error while executing this command!', flags: MessageFlags.Ephemeral });
+		try {
+			if (interaction.replied || interaction.deferred) {
+				await interaction.followUp({ content: 'There was an error while executing this command!', flags: MessageFlags.Ephemeral });
+			} else {
+				await interaction.reply({ content: 'There was an error while executing this command!', flags: MessageFlags.Ephemeral });
+			}
+		} catch (replyError) {
+			console.error('Failed to send error response:', replyError);
 		}
 	}
 });
 
+// Send a sticker when the watched user comes online
+client.on(Events.PresenceUpdate, async (oldPresence, newPresence) => {
+	if (newPresence.userId !== userId) return;
+	const wasOnline = oldPresence?.status === 'online';
+	const isOnline = newPresence.status === 'online';
+	if (!wasOnline && isOnline) {
+		try {
+			const channel = await client.channels.fetch(channelId);
+			await channel.send({ stickers: [stickerId] });
+		} catch (error) {
+			console.error('Failed to send sticker:', error);
+		}
+	}
+});
 
-// Log in to Discord with your client's token
+client.on('error', error => console.error('Client error:', error));
+
 client.login(token);
